@@ -8,13 +8,13 @@ to the off-grid SOC floor as before.
 
 ## Install
 
-`pip` in this environment defaults to a private CodeArtifact mirror that
-returns 401 for public packages. Install against PyPI explicitly:
-
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install --index-url https://pypi.org/simple/ -r requirements.txt
+.venv/bin/pip install -r requirements.txt
 ```
+
+> If your `pip` is configured against a private index that doesn't proxy
+> PyPI, add `--index-url https://pypi.org/simple/`.
 
 Copy and fill in the config:
 
@@ -78,7 +78,7 @@ Once you're happy with the dry-run output, flip `EG4_DRY_RUN=0` in `.env`
 and install the cron entry:
 
 ```cron
-*/15 * * * * cd /Users/siddarth/src/eg4-controller && \
+*/15 * * * * cd /path/to/eg4-controller && \
   set -a && . ./.env && set +a && \
   .venv/bin/python guardrail.py >> /var/log/eg4-guardrail.log 2>&1
 ```
