@@ -34,6 +34,8 @@ The `--guided` wizard will ask for:
 - **EG4SerialNumber** — leave blank to use the first inverter on your
   account, or paste your inverter SN
 - **DryRun** — leave `1` for the first deploy
+- **AlarmEmail** — *(optional)* email to receive sustained-failure
+  alerts. Leave blank to skip. See [Alerting](#alerting) below.
 - (other params) — defaults match the verified FlexBOSS21 setup
 - **Save arguments to configuration file** — say **yes**. SAM writes
   `samconfig.toml` so future deploys are one command:
@@ -99,6 +101,56 @@ sam deploy --template lambda/template.yaml \
 AWS cron is 6-field with `?` placeholder in either day-of-month or
 day-of-week (not both). See
 <https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-scheduled-rule-pattern.html>.
+
+## Alerting
+
+Set the `AlarmEmail` parameter on deploy to receive an email when the
+guardrail has been failing for a sustained period. If `AlarmEmail` is
+blank, no SNS topic or alarm is created.
+
+```sh
+sam deploy --template lambda/template.yaml \
+  --parameter-overrides AlarmEmail=you@example.com
+```
+
+After the deploy AWS will send a one-time **subscription confirmation
+email** from `no-reply@sns.amazonaws.com`. Click the link in that email
+or no alerts will reach you (the SNS subscription stays in
+`PendingConfirmation`).
+
+**What "sustained" means:** the alarm only fires when the Lambda has had
+**≥1 error in each of the last 3 consecutive 1-hour windows** (~3 hours
+of continuous trouble, ~6 failed invocations on the default 30-min
+schedule). Single transient EG4 cloud blips are already absorbed by the
+retry logic in `guardrail.py`, so a single bad invocation is almost
+always noise and won't trigger an alert.
+
+You'll also receive an "all clear" email when the alarm transitions back
+to OK.
+
+**Cost:** $0/month within the AWS perpetual free tier (10 CloudWatch
+alarms + 1,000 SNS email notifications + 1 M SNS publishes per month
+free, and an alarm that only fires on real outages will use a vanishing
+fraction of any of those).
+
+To change the email address later:
+
+```sh
+sam deploy --template lambda/template.yaml \
+  --parameter-overrides AlarmEmail=newaddress@example.com
+```
+
+(SNS will email the new address for confirmation; the old one will be
+unsubscribed.)
+
+To disable alerting entirely:
+
+```sh
+sam deploy --template lambda/template.yaml \
+  --parameter-overrides AlarmEmail=""
+```
+
+(Deletes the SNS topic, subscription, and alarm.)
 
 ## Teardown
 

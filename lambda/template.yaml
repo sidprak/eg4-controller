@@ -47,6 +47,17 @@ Parameters:
   PvField:
     Type: String
     Default: "ppv"
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: |
+      Email address for sustained-failure alerts. If blank, no alarm or
+      SNS topic is created. AWS will send a one-time confirmation email
+      to this address; click the link or no notifications will be
+      delivered (subscription stays in PendingConfirmation).
+
+Conditions:
+  AlarmEmailProvided: !Not [!Equals [!Ref AlarmEmail, ""]]
 
 Resources:
   GuardrailFunction:
@@ -92,9 +103,62 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${GuardrailFunction}
       RetentionInDays: 14
 
+  # ----- Alerting (optional, only if AlarmEmail is set) -----
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: AlarmEmailProvided
+    Properties:
+      DisplayName: EG4 guardrail alerts
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: AlarmEmailProvided
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # "Sustained failure" alarm: fires only when the Lambda has at least one
+  # error in EACH of the last 3 consecutive 1-hour buckets. With the
+  # default 30-min schedule that's 6 invocations spanning 3 hours, so this
+  # catches "the guardrail has been broken for a while" rather than "one
+  # transient EG4 cloud blip that the retry logic should handle". The
+  # retry logic in guardrail.py already handles single DEVICE_OFFLINE
+  # bursts, so a single failed invocation is almost always noise.
+  SustainedFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmEmailProvided
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-sustained-failure
+      AlarmDescription: |
+        EG4 guardrail has had at least one error in each of the last 3
+        consecutive 1-hour windows. The retry logic already absorbs
+        single transient failures, so this alarm indicates a real
+        problem (auth broken, EG4 cloud down, register schema changed,
+        write being rejected, etc).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GuardrailFunction
+      Statistic: Sum
+      Period: 3600                       # 1 hour buckets
+      EvaluationPeriods: 3               # look at last 3 buckets
+      DatapointsToAlarm: 3               # all 3 must breach
+      Threshold: 1                       # >=1 error per bucket
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching     # no invocations -> not a failure for THIS alarm
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]      # so you get the "all good" recovery email too
+
 Outputs:
   FunctionName:
     Value: !Ref GuardrailFunction
     Description: Lambda function name (for manual invokes / log tailing)
   FunctionArn:
     Value: !GetAtt GuardrailFunction.Arn
+  AlertsTopicArn:
+    Condition: AlarmEmailProvided
+    Value: !Ref AlertsTopic
+    Description: SNS topic that fans out sustained-failure alerts
