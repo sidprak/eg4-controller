@@ -61,7 +61,7 @@ aws lambda invoke --function-name $(aws cloudformation describe-stacks \
 You should see the same structured log line we saw locally:
 
 ```
-decision=cap_off pv_w=1465 current_soc=2 desired_soc=2 action=none verify=skipped | {...}
+decision=cap_off pv_w=1465 current=100 desired=100 action=none verify=skipped | {...}
 ```
 
 ## Run discover from Lambda

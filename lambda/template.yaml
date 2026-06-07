@@ -28,20 +28,22 @@ Parameters:
   PvCapOnW:
     Type: String
     Default: "1700"
-    Description: PV watts above which the cap turns ON. Cap-on writes CapOnSoc.
+    Description: PV watts above which the cap turns ON. Cap-on writes CapOnThresholdW.
   PvCapOffW:
     Type: String
     Default: "1200"
     Description: PV watts below which the cap turns OFF. Between cap-on and cap-off, previous state is held (hysteresis prevents flapping on spiky clouds).
-  NormalDischargeSoc:
-    Type: String
-    Default: "2"
-  CapOnSoc:
+  NormalDischargeThresholdW:
     Type: String
     Default: "100"
+    Description: Grid-import threshold (W) restored when cap is OFF. Matches FlexBOSS21 factory "Start Discharge P_import(W)".
+  CapOnThresholdW:
+    Type: String
+    Default: "30000"
+    Description: Grid-import threshold (W) written when cap is ON. Well above any realistic home grid-import, so battery never discharges to on-grid loads.
   HoldParamDischarge:
     Type: String
-    Default: "HOLD_DISCHG_CUT_OFF_SOC_EOD"
+    Default: "HOLD_P_TO_USER_START_DISCHG"
   PvField:
     Type: String
     Default: "ppv"
@@ -53,7 +55,10 @@ Resources:
       PackageType: Image
       Architectures: [arm64]
       MemorySize: 256
-      Timeout: 120
+      # Worst-case run: ~30 s normal EG4 cloud latency + one write retry
+      # (90 s sleep + ~5 s) + one verify-read retry (45 s + ~5 s) ≈ 175 s.
+      # 240 s leaves headroom for cold start and longer cloud latency.
+      Timeout: 240
       Events:
         ScheduledRun:
           Type: Schedule
@@ -69,8 +74,8 @@ Resources:
           EG4_DRY_RUN: !Ref DryRun
           EG4_PV_CAP_ON_W: !Ref PvCapOnW
           EG4_PV_CAP_OFF_W: !Ref PvCapOffW
-          EG4_NORMAL_DISCHARGE_SOC: !Ref NormalDischargeSoc
-          EG4_CAP_ON_SOC: !Ref CapOnSoc
+          EG4_NORMAL_DISCHARGE_THRESHOLD_W: !Ref NormalDischargeThresholdW
+          EG4_CAP_ON_THRESHOLD_W: !Ref CapOnThresholdW
           EG4_HOLD_PARAM_DISCHARGE: !Ref HoldParamDischarge
           EG4_PV_FIELD: !Ref PvField
       LoggingConfig:
