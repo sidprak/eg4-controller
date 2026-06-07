@@ -25,9 +25,14 @@ Parameters:
     Default: "1"
     AllowedValues: ["0", "1"]
     Description: 1 = decide+log only, 0 = real writes. Keep 1 until you've watched a day of logs.
-  PvThresholdW:
+  PvCapOnW:
     Type: String
     Default: "1700"
+    Description: PV watts above which the cap turns ON. Cap-on writes CapOnSoc.
+  PvCapOffW:
+    Type: String
+    Default: "1200"
+    Description: PV watts below which the cap turns OFF. Between cap-on and cap-off, previous state is held (hysteresis prevents flapping on spiky clouds).
   NormalDischargeSoc:
     Type: String
     Default: "2"
@@ -62,7 +67,8 @@ Resources:
           EG4_PASSWORD: !Ref EG4Password
           EG4_SERIAL_NUMBER: !Ref EG4SerialNumber
           EG4_DRY_RUN: !Ref DryRun
-          EG4_PV_THRESHOLD_W: !Ref PvThresholdW
+          EG4_PV_CAP_ON_W: !Ref PvCapOnW
+          EG4_PV_CAP_OFF_W: !Ref PvCapOffW
           EG4_NORMAL_DISCHARGE_SOC: !Ref NormalDischargeSoc
           EG4_CAP_ON_SOC: !Ref CapOnSoc
           EG4_HOLD_PARAM_DISCHARGE: !Ref HoldParamDischarge

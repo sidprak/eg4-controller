@@ -254,11 +254,24 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> int:
-    pv_threshold = _env_int("EG4_PV_THRESHOLD_W", 1700)
+    # Hysteresis thresholds. Two separate W cutoffs so spiky/cloudy days don't
+    # flip the cap every 15 min. Defaults derived from EG4_PV_THRESHOLD_W (legacy
+    # single-threshold var) if the new ones aren't explicitly set, so existing
+    # deploys keep their behavior unless reconfigured.
+    legacy = _env_int("EG4_PV_THRESHOLD_W", 1700)
+    pv_cap_on_w = _env_int("EG4_PV_CAP_ON_W", legacy)
+    pv_cap_off_w = _env_int("EG4_PV_CAP_OFF_W", max(0, legacy - 500))
     normal_soc = os.getenv("EG4_NORMAL_DISCHARGE_SOC", "2")
     cap_on_soc = os.getenv("EG4_CAP_ON_SOC", DEFAULT_CAP_ON_SOC)
     hold_param = os.getenv("EG4_HOLD_PARAM_DISCHARGE", DEFAULT_HOLD_PARAM_DISCHARGE)
     pv_field = os.getenv("EG4_PV_FIELD", "ppv")
+
+    if pv_cap_on_w < pv_cap_off_w:
+        _emit({"decision": "error", "action": "none", "verify": "skipped",
+               "error": f"EG4_PV_CAP_ON_W ({pv_cap_on_w}) must be >= "
+                        f"EG4_PV_CAP_OFF_W ({pv_cap_off_w}); otherwise "
+                        "hysteresis logic is inverted"})
+        return 2
 
     try:
         normal_soc_int = int(float(normal_soc))
@@ -306,10 +319,8 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
                "error": f"PV field '{pv_field}' missing/unparseable in runtime data"})
         return 2
 
-    cap_on = pv_w > pv_threshold
-    desired_soc = str(cap_on_soc_int) if cap_on else str(normal_soc_int)
-    decision = "cap_on" if cap_on else "cap_off"
-
+    # Read current setting first; needed both for hold-zone behavior and the
+    # idempotency check below.
     settings, bank_status = await _read_settings_tolerant(api)
     if not settings:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
@@ -320,23 +331,43 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
     current_raw = _extract_setting_value(settings, hold_param)
     if current_raw is None:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
-               "pv_w": pv_w, "desired_soc": desired_soc,
-               "hold_param": hold_param, "bank_status": bank_status,
+               "pv_w": pv_w, "hold_param": hold_param, "bank_status": bank_status,
                "error": f"hold_param '{hold_param}' not found in settings; "
                         "run --discover to confirm key"})
         return 2
 
+    # Three-zone hysteresis:
+    #   PV >  cap_on_w   → cap_on  (write cap_on_soc)
+    #   PV <  cap_off_w  → cap_off (write normal_soc)
+    #   between          → hold    (leave current value alone)
+    # The "hold" zone is what prevents flapping when PV spikes around a single
+    # threshold. We define `desired_soc = current_raw` so the idempotency check
+    # below will naturally short-circuit with action=none.
+    if pv_w > pv_cap_on_w:
+        decision = "cap_on"
+        desired_soc = str(cap_on_soc_int)
+    elif pv_w < pv_cap_off_w:
+        decision = "cap_off"
+        desired_soc = str(normal_soc_int)
+    else:
+        decision = "hold"
+        desired_soc = current_raw
+
     if _numeric_equal(current_raw, desired_soc):
+        reason = ("in hysteresis hold zone" if decision == "hold"
+                  else "already at desired value")
         _emit({"decision": decision, "action": "none", "verify": "skipped",
-               "pv_w": pv_w, "pv_threshold_w": pv_threshold,
+               "pv_w": pv_w, "pv_cap_on_w": pv_cap_on_w,
+               "pv_cap_off_w": pv_cap_off_w,
                "current_soc": current_raw, "desired_soc": desired_soc,
                "hold_param": hold_param, "dry_run": dry_run,
-               "reason": "already at desired value"})
+               "reason": reason})
         return 0
 
     if dry_run:
         _emit({"decision": decision, "action": "would_write", "verify": "skipped",
-               "pv_w": pv_w, "pv_threshold_w": pv_threshold,
+               "pv_w": pv_w, "pv_cap_on_w": pv_cap_on_w,
+               "pv_cap_off_w": pv_cap_off_w,
                "current_soc": current_raw, "desired_soc": desired_soc,
                "hold_param": hold_param, "dry_run": True})
         return 0
@@ -344,7 +375,8 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
     ok = await api.write_setting_async(hold_param, desired_soc)
     if not ok:
         _emit({"decision": decision, "action": "write", "verify": "fail",
-               "pv_w": pv_w, "pv_threshold_w": pv_threshold,
+               "pv_w": pv_w, "pv_cap_on_w": pv_cap_on_w,
+               "pv_cap_off_w": pv_cap_off_w,
                "current_soc": current_raw, "desired_soc": desired_soc,
                "hold_param": hold_param, "dry_run": False,
                "error": "write_setting_async returned non-success"})
@@ -354,7 +386,8 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
     verify_raw = _extract_setting_value(verify_settings, hold_param)
     verify = "pass" if verify_raw is not None and _numeric_equal(verify_raw, desired_soc) else "fail"
     _emit({"decision": decision, "action": "write", "verify": verify,
-           "pv_w": pv_w, "pv_threshold_w": pv_threshold,
+           "pv_w": pv_w, "pv_cap_on_w": pv_cap_on_w,
+           "pv_cap_off_w": pv_cap_off_w,
            "current_soc": current_raw, "desired_soc": desired_soc,
            "post_write_soc": verify_raw, "hold_param": hold_param,
            "dry_run": False})

@@ -29,10 +29,11 @@ We control **`HOLD_DISCHG_CUT_OFF_SOC_EOD`** — the same value the EG4 web
 UI calls **"On-Grid Cut-Off SOC (%)"**. When SOC ≤ this value, the inverter
 stops discharging to on-grid loads.
 
-| State | Value written | UI shows |
+| Zone | PV power | Action |
 |---|---|---|
-| Cap **ON** (PV > threshold) | `EG4_CAP_ON_SOC` (default `100`) | inverter never discharges on-grid |
-| Cap **OFF** (PV ≤ threshold) | `EG4_NORMAL_DISCHARGE_SOC` (default `2`) | normal behavior, drain to 2% SOC |
+| Cap **ON** | `pv_w > EG4_PV_CAP_ON_W` (default 1700) | write `EG4_CAP_ON_SOC` (default `100`) — never discharges on-grid |
+| **Hold** | between cap-off and cap-on | leave current value alone (hysteresis — prevents flapping on spiky clouds) |
+| Cap **OFF** | `pv_w < EG4_PV_CAP_OFF_W` (default 1200) | write `EG4_NORMAL_DISCHARGE_SOC` (default `2`) — normal behavior |
 
 Crucially this does **not** touch `HOLD_SOC_LOW_LIMIT_EPS_DISCHG` (the
 off-grid floor, currently `0`), so EPS/backup keeps full battery access.
