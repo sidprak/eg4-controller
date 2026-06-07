@@ -88,12 +88,12 @@ sam deploy --template lambda/template.yaml \
 
 ## Tweak schedule
 
-The default is `cron(*/15 * * * ? *)` — every 15 min UTC. To run every 30
-min instead (halves invocations + cost):
+The default is `cron(*/30 * * * ? *)` — every 30 min UTC. To run every 15
+min instead:
 
 ```sh
 sam deploy --template lambda/template.yaml \
-  --parameter-overrides 'ScheduleExpression="cron(*/30 * * * ? *)"'
+  --parameter-overrides 'ScheduleExpression="cron(*/15 * * * ? *)"'
 ```
 
 AWS cron is 6-field with `?` placeholder in either day-of-month or

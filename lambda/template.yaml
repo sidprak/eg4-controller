@@ -18,8 +18,8 @@ Parameters:
     Description: Optional inverter serial. If blank, uses the first inverter on the account.
   ScheduleExpression:
     Type: String
-    Default: "cron(*/15 * * * ? *)"
-    Description: EventBridge cron expression (UTC). Default = every 15 min.
+    Default: "cron(*/30 * * * ? *)"
+    Description: EventBridge cron expression (UTC). Default = every 30 min.
   DryRun:
     Type: String
     Default: "1"
