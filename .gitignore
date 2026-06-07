@@ -1,0 +1,22 @@
+# Real credentials — never commit
+.env
+
+# Local discover dumps (contain inverter serial)
+discover.json
+discover*.json
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
