@@ -82,6 +82,9 @@ and install the cron entry:
   .venv/bin/python guardrail.py >> /var/log/eg4-guardrail.log 2>&1
 ```
 
+For a hands-off cloud deployment, see [`lambda/README.md`](./lambda/README.md)
+— AWS Lambda + EventBridge cron, free within the AWS free tier.
+
 ## Modes
 
 | Flag           | Behavior                                                  |

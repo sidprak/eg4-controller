@@ -1,0 +1,89 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: EG4 battery discharge guardrail (Lambda container + EventBridge cron)
+
+Parameters:
+  EG4Username:
+    Type: String
+    NoEcho: true
+    Description: EG4 cloud monitor login email
+  EG4Password:
+    Type: String
+    NoEcho: true
+    Description: EG4 cloud monitor password
+  EG4SerialNumber:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Optional inverter serial. If blank, uses the first inverter on the account.
+  ScheduleExpression:
+    Type: String
+    Default: "cron(*/15 * * * ? *)"
+    Description: EventBridge cron expression (UTC). Default = every 15 min.
+  DryRun:
+    Type: String
+    Default: "1"
+    AllowedValues: ["0", "1"]
+    Description: 1 = decide+log only, 0 = real writes. Keep 1 until you've watched a day of logs.
+  PvThresholdW:
+    Type: String
+    Default: "1700"
+  NormalDischargeSoc:
+    Type: String
+    Default: "2"
+  CapOnSoc:
+    Type: String
+    Default: "100"
+  HoldParamDischarge:
+    Type: String
+    Default: "HOLD_DISCHG_CUT_OFF_SOC_EOD"
+  PvField:
+    Type: String
+    Default: "ppv"
+
+Resources:
+  GuardrailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 120
+      Events:
+        ScheduledRun:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+            Description: EG4 guardrail scheduled run
+            Input: '{}'
+      Environment:
+        Variables:
+          EG4_USERNAME: !Ref EG4Username
+          EG4_PASSWORD: !Ref EG4Password
+          EG4_SERIAL_NUMBER: !Ref EG4SerialNumber
+          EG4_DRY_RUN: !Ref DryRun
+          EG4_PV_THRESHOLD_W: !Ref PvThresholdW
+          EG4_NORMAL_DISCHARGE_SOC: !Ref NormalDischargeSoc
+          EG4_CAP_ON_SOC: !Ref CapOnSoc
+          EG4_HOLD_PARAM_DISCHARGE: !Ref HoldParamDischarge
+          EG4_PV_FIELD: !Ref PvField
+      LoggingConfig:
+        LogFormat: JSON
+    Metadata:
+      DockerTag: latest
+      DockerContext: ../
+      Dockerfile: lambda/Dockerfile
+
+  # 14-day retention keeps log storage costs negligible (default is never expire).
+  GuardrailFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${GuardrailFunction}
+      RetentionInDays: 14
+
+Outputs:
+  FunctionName:
+    Value: !Ref GuardrailFunction
+    Description: Lambda function name (for manual invokes / log tailing)
+  FunctionArn:
+    Value: !GetAtt GuardrailFunction.Arn

@@ -1,5 +1,7 @@
 # Real credentials — never commit
 .env
+samconfig.toml
+.aws-sam/
 
 # Local discover dumps (contain inverter serial)
 discover.json
