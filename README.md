@@ -37,9 +37,9 @@ untouched (separate `HOLD_SOC_LOW_LIMIT_EPS_DISCHG` floor).
 
 | Zone | PV power | Action |
 |---|---|---|
-| Cap **ON** | `pv_w > EG4_PV_CAP_ON_W` (default 1700) | write `EG4_CAP_ON_SOC` (default `100`) — battery never discharges to on-grid loads |
+| Cap **ON** | `pv_w > EG4_PV_CAP_ON_W` (default 2000) | write `EG4_CAP_ON_SOC` (default `100`) — battery never discharges to on-grid loads |
 | **Hold** | between cap-off and cap-on | leave current value alone (hysteresis — prevents flapping on spiky clouds) |
-| Cap **OFF** | `pv_w < EG4_PV_CAP_OFF_W` (default 1200) | write `EG4_NORMAL_DISCHARGE_SOC` (default `2`) — normal behavior |
+| Cap **OFF** | `pv_w < EG4_PV_CAP_OFF_W` (default 1500) | write `EG4_NORMAL_DISCHARGE_SOC` (default `2`) — normal behavior |
 
 > **Rejected levers.** Writing `30000` to `HOLD_P_TO_USER_START_DISCHG`
 > ("Start Discharge P_import(W)") is a no-op on FlexBOSS21 — the battery
