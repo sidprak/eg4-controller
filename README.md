@@ -20,33 +20,33 @@ Copy and fill in the config:
 
 ```sh
 cp .env.example .env
-$EDITOR .env   # set EG4_USERNAME, EG4_PASSWORD, EG4_NORMAL_DISCHARGE_THRESHOLD_W, ...
+$EDITOR .env   # set EG4_USERNAME, EG4_PASSWORD, EG4_NORMAL_DISCHARGE_SOC, ...
 ```
 
 ## How the cap works
 
-We control **`HOLD_P_TO_USER_START_DISCHG`** — the same value the EG4 web
-UI calls **"Start Discharge P_import(W)"**. It's the grid-import power
-(watts) at which the battery is allowed to start discharging to on-grid
-loads. Set it well above the home's peak grid-import (default `30000` W)
-and the battery never contributes to on-grid loads — the Emporia EV
-charger therefore sees real grid flow, not a misleading "near-zero"
-reading caused by silent battery backfill, and correctly throttles itself
-in excess-solar mode.
+We control **`HOLD_DISCHG_CUT_OFF_SOC_EOD`** — the value the EG4 web UI
+calls **"On-Grid Cut-Off SOC(%)"** (requires *Batt Discharge Control = SOC*).
+While the grid is up, the battery serves on-grid loads only while SOC is
+above this cutoff. Set it to `100` and on-grid discharge stops at any SOC:
+loads above PV pull from grid instead of from the battery — so the Emporia
+EV charger sees real grid flow, not a misleading "near-zero" reading from
+silent battery backfill, and correctly throttles itself in excess-solar
+mode. PV continues to serve loads normally, and off-grid/EPS backup is
+untouched (separate `HOLD_SOC_LOW_LIMIT_EPS_DISCHG` floor).
 
 | Zone | PV power | Action |
 |---|---|---|
-| Cap **ON** | `pv_w > EG4_PV_CAP_ON_W` (default 1700) | write `EG4_CAP_ON_THRESHOLD_W` (default `30000`) — battery never discharges to on-grid loads |
+| Cap **ON** | `pv_w > EG4_PV_CAP_ON_W` (default 1700) | write `EG4_CAP_ON_SOC` (default `100`) — battery never discharges to on-grid loads |
 | **Hold** | between cap-off and cap-on | leave current value alone (hysteresis — prevents flapping on spiky clouds) |
-| Cap **OFF** | `pv_w < EG4_PV_CAP_OFF_W` (default 1200) | write `EG4_NORMAL_DISCHARGE_THRESHOLD_W` (default `100`) — normal behavior |
+| Cap **OFF** | `pv_w < EG4_PV_CAP_OFF_W` (default 1200) | write `EG4_NORMAL_DISCHARGE_SOC` (default `2`) — normal behavior |
 
-> **Why not `HOLD_DISCHG_CUT_OFF_SOC_EOD` ("On-Grid Cut-Off SOC %")?**
-> An earlier version of this script wrote `100` to that register, expecting
-> "stop discharging at any SOC". In practice, setting cut-off SOC above
-> current SOC puts the inverter into "End Of Discharge reached → grid
-> bypass" mode, which **also disables PV→loads pass-through** — defeating
-> the goal. `P_TO_USER_START_DISCHG` is the correct lever: same end result
-> for battery output, but PV continues to serve loads normally.
+> **Rejected levers.** Writing `30000` to `HOLD_P_TO_USER_START_DISCHG`
+> ("Start Discharge P_import(W)") is a no-op on FlexBOSS21 — the battery
+> still feeds on-grid loads. `HOLD_DISCHG_POWER_PERCENT_CMD=0` would stop
+> discharge but also disables EPS backup. Live testing confirmed
+> `HOLD_DISCHG_CUT_OFF_SOC_EOD=100` blocks on-grid discharge (deficit
+> served from grid) while PV→loads pass-through and EPS backup stay intact.
 
 Crucially this does **not** touch `HOLD_SOC_LOW_LIMIT_EPS_DISCHG` (the
 off-grid floor, currently `0`), so EPS/backup keeps full battery access.
@@ -84,7 +84,7 @@ right:
 Each run emits one line shaped like:
 
 ```
-decision=cap_on pv_w=1959.0 current=100 desired=30000 action=would_write verify=skipped | {...json...}
+decision=cap_on pv_w=1959.0 current=2 desired=100 action=would_write verify=skipped | {...json...}
 ```
 
 ## Cron (every 30 min)

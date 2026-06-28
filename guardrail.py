@@ -52,38 +52,33 @@ WRITE_RETRY_BACKOFF_S = 90
 READ_MAX_ATTEMPTS = 2
 READ_RETRY_BACKOFF_S = 45
 
-# Default hold-register key. UI label: "Start Discharge P_import(W)".
-# Meaning: battery only starts discharging TO ON-GRID LOADS once the power
-# imported from the grid exceeds this many watts. The factory default of
-# ~100 W means "any load triggers battery discharge". Setting this to a
-# value well above the home's peak possible grid-import (e.g. 30000 W)
-# effectively forbids on-grid battery discharge: loads that exceed PV
-# pull from grid instead of from the battery. Off-grid/EPS discharge is
-# unaffected (that uses a different code path).
+# Default hold-register key. UI label: "On-Grid Cut-Off SOC(%)".
+# Meaning: while the grid is present, the battery discharges to on-grid
+# loads only while SOC > this cutoff; at/below it, on-grid discharge stops
+# and the grid covers any load deficit (PV still serves loads normally).
+# So setting the cutoff to 100 forbids on-grid battery discharge at any
+# SOC, while leaving off-grid/EPS discharge — governed by the separate
+# HOLD_SOC_LOW_LIMIT_EPS_DISCHG floor — fully available in an outage.
 #
-# An earlier version of this script targeted HOLD_DISCHG_CUT_OFF_SOC_EOD
-# ("On-Grid Cut-Off SOC %") set to 100 — that turned out to put the
-# inverter into "end-of-discharge reached -> grid bypass" mode, which
-# DEFEATED the goal by also disabling PV->loads pass-through. Use
-# P_TO_USER_START_DISCHG instead: same end result for battery output,
-# but PV continues to serve loads normally.
-DEFAULT_HOLD_PARAM_DISCHARGE = "HOLD_P_TO_USER_START_DISCHG"
+# Two earlier levers were tried and rejected: HOLD_P_TO_USER_START_DISCHG
+# (30000) is a no-op on FlexBOSS21 — the battery still feeds on-grid loads;
+# HOLD_DISCHG_POWER_PERCENT_CMD=0 also disables EPS backup. Live testing
+# confirmed cutoff=100 blocks on-grid discharge (deficit served from grid)
+# while PV->loads pass-through and EPS backup remain intact.
+DEFAULT_HOLD_PARAM_DISCHARGE = "HOLD_DISCHG_CUT_OFF_SOC_EOD"
 
-# Default threshold (watts) written when the cap is ON. 30000 is well
-# above any realistic home grid-import, so battery never starts
-# discharging to on-grid loads while this is set. The register is a
-# signed 16-bit int on FlexBOSS21 (max 32767); leave headroom.
-DEFAULT_CAP_ON_THRESHOLD_W = "30000"
+# Default SOC (%) cutoff written when the cap is ON. 100 stops on-grid
+# discharge at any SOC; loads above PV pull from grid instead of battery.
+DEFAULT_CAP_ON_SOC = "100"
 
-# Default threshold (watts) restored when the cap is OFF. 100 matches the
-# typical FlexBOSS21 factory setting; set whatever shows in the EG4 web
-# UI as "Start Discharge P_import(W)" today.
-DEFAULT_NORMAL_THRESHOLD_W = "100"
+# Default SOC (%) cutoff restored when the cap is OFF. 2 matches the
+# typical FlexBOSS21 setting; set whatever shows in the EG4 web UI as
+# "On-Grid Cut-Off SOC(%)" today. Requires Batt Discharge Control = SOC.
+DEFAULT_NORMAL_SOC = "2"
 
-# Inverter register accepts a signed 16-bit value. Anything outside this
-# range will be rejected (or wrap) and is almost certainly a config typo.
-THRESHOLD_W_MIN = 0
-THRESHOLD_W_MAX = 32767
+# Cutoff is an SOC percentage; out-of-range values are config typos.
+SOC_MIN = 0
+SOC_MAX = 100
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -403,12 +398,12 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
     legacy = _env_int("EG4_PV_THRESHOLD_W", 1700)
     pv_cap_on_w = _env_int("EG4_PV_CAP_ON_W", legacy)
     pv_cap_off_w = _env_int("EG4_PV_CAP_OFF_W", max(0, legacy - 500))
-    # Hold-register threshold values (watts).
+    # Hold-register SOC cutoff values (%).
     normal_threshold = os.getenv(
-        "EG4_NORMAL_DISCHARGE_THRESHOLD_W", DEFAULT_NORMAL_THRESHOLD_W,
+        "EG4_NORMAL_DISCHARGE_SOC", DEFAULT_NORMAL_SOC,
     )
     cap_on_threshold = os.getenv(
-        "EG4_CAP_ON_THRESHOLD_W", DEFAULT_CAP_ON_THRESHOLD_W,
+        "EG4_CAP_ON_SOC", DEFAULT_CAP_ON_SOC,
     )
     hold_param = os.getenv("EG4_HOLD_PARAM_DISCHARGE", DEFAULT_HOLD_PARAM_DISCHARGE)
     pv_field = os.getenv("EG4_PV_FIELD", "ppv")
@@ -424,31 +419,31 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
         normal_int = int(float(normal_threshold))
     except ValueError:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
-               "error": f"EG4_NORMAL_DISCHARGE_THRESHOLD_W not numeric: "
+               "error": f"EG4_NORMAL_DISCHARGE_SOC not numeric: "
                         f"{normal_threshold!r}"})
         return 2
     try:
         cap_on_int = int(float(cap_on_threshold))
     except ValueError:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
-               "error": f"EG4_CAP_ON_THRESHOLD_W not numeric: "
+               "error": f"EG4_CAP_ON_SOC not numeric: "
                         f"{cap_on_threshold!r}"})
         return 2
-    if not THRESHOLD_W_MIN <= normal_int <= THRESHOLD_W_MAX:
+    if not SOC_MIN <= normal_int <= SOC_MAX:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
-               "error": f"EG4_NORMAL_DISCHARGE_THRESHOLD_W must be "
-                        f"{THRESHOLD_W_MIN}..{THRESHOLD_W_MAX}, got {normal_int}"})
+               "error": f"EG4_NORMAL_DISCHARGE_SOC must be "
+                        f"{SOC_MIN}..{SOC_MAX}, got {normal_int}"})
         return 2
-    if not THRESHOLD_W_MIN <= cap_on_int <= THRESHOLD_W_MAX:
+    if not SOC_MIN <= cap_on_int <= SOC_MAX:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
-               "error": f"EG4_CAP_ON_THRESHOLD_W must be "
-                        f"{THRESHOLD_W_MIN}..{THRESHOLD_W_MAX}, got {cap_on_int}"})
+               "error": f"EG4_CAP_ON_SOC must be "
+                        f"{SOC_MIN}..{SOC_MAX}, got {cap_on_int}"})
         return 2
     if cap_on_int <= normal_int:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
-               "error": f"EG4_CAP_ON_THRESHOLD_W ({cap_on_int}) must be > "
-                        f"EG4_NORMAL_DISCHARGE_THRESHOLD_W ({normal_int}); "
-                        "otherwise cap-on would not raise the threshold"})
+               "error": f"EG4_CAP_ON_SOC ({cap_on_int}) must be > "
+                        f"EG4_NORMAL_DISCHARGE_SOC ({normal_int}); "
+                        "otherwise cap-on would not raise the cutoff"})
         return 2
 
     dry_run = _env_bool("EG4_DRY_RUN", True)
