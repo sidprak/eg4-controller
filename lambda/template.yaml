@@ -25,22 +25,30 @@ Parameters:
     Default: "1"
     AllowedValues: ["0", "1"]
     Description: 1 = decide+log only, 0 = real writes. Keep 1 until you've watched a day of logs.
-  PvCapOnW:
+  GridbossSerial:
     Type: String
-    Default: "2000"
-    Description: PV watts above which the cap turns ON. Cap-on writes CapOnSoc.
-  PvCapOffW:
+    Default: ""
+    Description: GridBoss (MidBox) serial. If blank, auto-detected as the account's NO_BATTERY device.
+  EvSmartPort:
+    Type: String
+    Default: "1"
+    Description: GridBoss smart port the EV charger is wired to (1-4).
+  EvCapOnW:
     Type: String
     Default: "1500"
-    Description: PV watts below which the cap turns OFF. Between cap-on and cap-off, previous state is held (hysteresis prevents flapping on spiky clouds).
+    Description: EV smart-port watts above which the cap turns ON (EV actively charging).
+  EvCapOffW:
+    Type: String
+    Default: "1000"
+    Description: EV smart-port watts below which the cap turns OFF. Between the two, previous state is held (hysteresis around the ~1680W charging boundary).
   NormalDischargeSoc:
     Type: String
     Default: "2"
-    Description: On-grid cut-off SOC (%) restored when cap is OFF. Matches FlexBOSS21 "On-Grid Cut-Off SOC(%)". Requires Batt Discharge Control = SOC.
+    Description: On-grid cut-off SOC (%) restored when the EV is NOT charging. Matches FlexBOSS21 "On-Grid Cut-Off SOC(%)". Requires Batt Discharge Control = SOC.
   CapOnSoc:
     Type: String
     Default: "100"
-    Description: On-grid cut-off SOC (%) written when cap is ON. 100 forbids on-grid battery discharge; EPS/off-grid backup preserved via separate floor.
+    Description: On-grid cut-off SOC (%) written when the EV IS charging. 100 forbids on-grid battery discharge; EPS/off-grid backup preserved via separate floor.
   HoldParamDischarge:
     Type: String
     Default: "HOLD_DISCHG_CUT_OFF_SOC_EOD"
@@ -83,8 +91,10 @@ Resources:
           EG4_PASSWORD: !Ref EG4Password
           EG4_SERIAL_NUMBER: !Ref EG4SerialNumber
           EG4_DRY_RUN: !Ref DryRun
-          EG4_PV_CAP_ON_W: !Ref PvCapOnW
-          EG4_PV_CAP_OFF_W: !Ref PvCapOffW
+          EG4_GRIDBOSS_SERIAL: !Ref GridbossSerial
+          EG4_EV_SMART_PORT: !Ref EvSmartPort
+          EG4_EV_CAP_ON_W: !Ref EvCapOnW
+          EG4_EV_CAP_OFF_W: !Ref EvCapOffW
           EG4_NORMAL_DISCHARGE_SOC: !Ref NormalDischargeSoc
           EG4_CAP_ON_SOC: !Ref CapOnSoc
           EG4_HOLD_PARAM_DISCHARGE: !Ref HoldParamDischarge

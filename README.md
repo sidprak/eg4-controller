@@ -1,10 +1,13 @@
 # eg4-controller
 
-Stateless cron script that **forbids on-grid battery discharge while the sun
-is up** on an EG4 FlexBOSS21, so an Emporia EV charger in excess-solar mode
-can't silently drain the home battery. Off-grid/EPS backup is **not**
-affected — if the grid fails, the battery still powers your EPS loads down
-to the off-grid SOC floor as before.
+Stateless cron script that **forbids on-grid battery discharge while the EV
+charger is drawing excess solar** on an EG4 FlexBOSS21 + GridBoss, so an
+Emporia EV charger in excess-solar mode can't silently drain the home
+battery. The cap engages **only while the EV is actively charging** (read
+from its GridBoss smart port) — so normal household loads still draw from the
+battery as usual. Off-grid/EPS backup is **not** affected — if the grid
+fails, the battery still powers your EPS loads down to the off-grid SOC floor
+as before.
 
 ## Install
 
@@ -20,26 +23,37 @@ Copy and fill in the config:
 
 ```sh
 cp .env.example .env
-$EDITOR .env   # set EG4_USERNAME, EG4_PASSWORD, EG4_NORMAL_DISCHARGE_SOC, ...
+$EDITOR .env   # set EG4_USERNAME, EG4_PASSWORD, EG4_EV_SMART_PORT, ...
 ```
 
 ## How the cap works
 
-We control **`HOLD_DISCHG_CUT_OFF_SOC_EOD`** — the value the EG4 web UI
-calls **"On-Grid Cut-Off SOC(%)"** (requires *Batt Discharge Control = SOC*).
-While the grid is up, the battery serves on-grid loads only while SOC is
-above this cutoff. Set it to `100` and on-grid discharge stops at any SOC:
-loads above PV pull from grid instead of from the battery — so the Emporia
-EV charger sees real grid flow, not a misleading "near-zero" reading from
-silent battery backfill, and correctly throttles itself in excess-solar
-mode. PV continues to serve loads normally, and off-grid/EPS backup is
-untouched (separate `HOLD_SOC_LOW_LIMIT_EPS_DISCHG` floor).
+**Trigger — the EV charger's GridBoss smart port.** Each run reads the
+GridBoss (MidBox) runtime and sums the EV port's L1+L2 active power. The
+Emporia only excess-solar charges at ≥7 A @ 240 V (~1680 W) or not at all, so
+the port reads ~0 W (idle) or ≥1680 W (charging) with a clean gap between.
 
-| Zone | PV power | Action |
+**Lever — `HOLD_DISCHG_CUT_OFF_SOC_EOD`**, the value the EG4 web UI calls
+**"On-Grid Cut-Off SOC(%)"** (requires *Batt Discharge Control = SOC*). While
+the grid is up, the battery serves on-grid loads only while SOC is above this
+cutoff. Set it to `100` and on-grid discharge stops at any SOC: the EV's load
+above PV pulls from grid instead of from the battery — so the Emporia sees
+real grid flow, not a misleading "near-zero" reading from silent battery
+backfill, and correctly throttles itself. Off-grid/EPS backup is untouched
+(separate `HOLD_SOC_LOW_LIMIT_EPS_DISCHG` floor).
+
+| Zone | EV smart-port power | Action |
 |---|---|---|
-| Cap **ON** | `pv_w > EG4_PV_CAP_ON_W` (default 2000) | write `EG4_CAP_ON_SOC` (default `100`) — battery never discharges to on-grid loads |
-| **Hold** | between cap-off and cap-on | leave current value alone (hysteresis — prevents flapping on spiky clouds) |
-| Cap **OFF** | `pv_w < EG4_PV_CAP_OFF_W` (default 1500) | write `EG4_NORMAL_DISCHARGE_SOC` (default `2`) — normal behavior |
+| Cap **ON** | `ev_w > EG4_EV_CAP_ON_W` (default 1500) | write `EG4_CAP_ON_SOC` (default `100`) — battery won't backfill the EV |
+| **Hold** | between cap-off and cap-on | leave current value alone (hysteresis around the ~1680 W boundary) |
+| Cap **OFF** | `ev_w < EG4_EV_CAP_OFF_W` (default 1000) | write `EG4_NORMAL_DISCHARGE_SOC` (default `2`) — normal battery behavior |
+
+> **Why trigger on EV load, not PV?** An earlier version keyed the cap on PV
+> power. That caused two problems: (1) with cutoff=100 at low SOC the inverter
+> enters "end-of-discharge → grid bypass", running the house on grid while PV
+> charges the battery; and (2) normal evening loads (dishwasher/laundry) at
+> PV~2 kW got pushed to grid instead of the battery. Keying on the EV smart
+> port confines the cap to exactly the situation it's meant for.
 
 > **Rejected levers.** Writing `30000` to `HOLD_P_TO_USER_START_DISCHG`
 > ("Start Discharge P_import(W)") is a no-op on FlexBOSS21 — the battery
@@ -67,9 +81,13 @@ during normal runs the script skips them entirely to avoid the dongle
 contention that causes `DEVICE_OFFLINE` storms; `--discover` still attempts
 them so you can confirm your firmware's behavior).
 
-The dump also lists runtime keys so you can confirm `EG4_PV_FIELD` (default
-`ppv`) carries PV power in watts. Logs go to stderr so `> discover.json`
-captures clean JSON.
+It also includes a `gridboss_serial` and a `gridboss_smart_ports` block with
+each port's status and active power — use these to confirm `EG4_GRIDBOSS_SERIAL`
+and pick the `EG4_EV_SMART_PORT` your EV charger is wired to (plug it in and
+watch which port's `active_power_w` rises). The dump lists runtime keys too so
+you can confirm `EG4_PV_FIELD` (default `ppv`) carries PV power in watts (used
+for log context only). Logs go to stderr so `> discover.json` captures clean
+JSON.
 
 ## Dry-run rollout
 
@@ -84,7 +102,7 @@ right:
 Each run emits one line shaped like:
 
 ```
-decision=cap_on pv_w=1959.0 current=2 desired=100 action=would_write verify=skipped | {...json...}
+decision=cap_on ev_w=6480.0 current=2 desired=100 action=would_write verify=skipped | {...json...}
 ```
 
 ## Cron (every 30 min)

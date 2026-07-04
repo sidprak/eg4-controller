@@ -80,6 +80,22 @@ DEFAULT_NORMAL_SOC = "2"
 SOC_MIN = 0
 SOC_MAX = 100
 
+# GridBoss (MidBox) smart-port EV trigger. The cap engages only while the EV
+# charger on this smart port is actively drawing power (excess-solar
+# charging), so normal household loads and idle periods never trip it. We read
+# per-port active power (W) from the midbox runtime endpoint and sum L1+L2.
+MIDBOX_RUNTIME_ENDPOINT = "/WManage/api/midbox/getMidboxRuntime"
+
+# GridBoss smart port the EV charger is wired to (1-4). UI: "Smart Port N".
+DEFAULT_EV_SMART_PORT = "1"
+
+# EV-load hysteresis (watts). The Emporia only excess-solar charges at >=7 A
+# @ 240 V (~1680 W) or not at all, so smart-port power is cleanly ~0 (idle)
+# or >=1680 (charging). Cap ON above CAP_ON_W, OFF below CAP_OFF_W; between,
+# the previous state is held (prevents flapping at the charging boundary).
+DEFAULT_EV_CAP_ON_W = 1500
+DEFAULT_EV_CAP_OFF_W = 1000
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -124,11 +140,11 @@ def _emit(record: dict[str, Any]) -> None:
     decision = record.get("decision", "?")
     action = record.get("action", "?")
     verify = record.get("verify", "?")
-    pv_w = record.get("pv_w")
+    ev_w = record.get("ev_w")
     current = record.get("current_value")
     desired = record.get("desired_value")
     summary = (
-        f"decision={decision} pv_w={pv_w} current={current} "
+        f"decision={decision} ev_w={ev_w} current={current} "
         f"desired={desired} action={action} verify={verify}"
     )
     line = f"{summary} | {json.dumps(record, default=str, sort_keys=True)}"
@@ -166,6 +182,68 @@ def _extract_pv_w(rt: Any, field: str) -> float | None:
         return float(val)
     except (TypeError, ValueError):
         return None
+
+
+def _resolve_gridboss_serial(api: EG4InverterAPI) -> str | None:
+    """Return the GridBoss (MidBox) serial to read smart-port power from.
+
+    Honors EG4_GRIDBOSS_SERIAL if set; otherwise auto-detects the batteryless
+    device on the account (the GridBoss reports batteryType=NO_BATTERY /
+    deviceType=9, distinct from the FlexBOSS inverter).
+    """
+    explicit = os.getenv("EG4_GRIDBOSS_SERIAL")
+    if explicit and explicit.strip():
+        return explicit.strip()
+    try:
+        inverters = api.get_inverters()
+    except Exception:  # noqa: BLE001 — caller treats None as fail-safe
+        return None
+    for inv in inverters:
+        if getattr(inv, "batteryType", None) == "NO_BATTERY" or \
+                getattr(inv, "deviceType", None) == 9:
+            sn = getattr(inv, "serialNum", None)
+            if sn:
+                return str(sn)
+    return None
+
+
+async def _read_ev_power(
+    api: EG4InverterAPI, gridboss_serial: str, smart_port: int,
+) -> tuple[float | None, str | None]:
+    """Return (EV active power in W, error). Sums smart-port L1+L2 active power.
+
+    Reads the GridBoss midbox runtime, retrying transient failures. Returns
+    (None, reason) if the port power can't be read so the caller fails safe
+    without writing a guessed cap state.
+    """
+    url = f"{api._base_url}{MIDBOX_RUNTIME_ENDPOINT}"
+    payload = f"serialNum={gridboss_serial}"
+    last_err: str | None = None
+    for attempt in range(1, READ_MAX_ATTEMPTS + 1):
+        try:
+            resp = await api._request("POST", url, payload)
+        except Exception as e:  # noqa: BLE001 — treat as transient, retry
+            last_err = f"{type(e).__name__}: {e}"
+            resp = None
+        if resp is not None:
+            if not resp.get("success"):
+                last_err = f"midbox read success=false: msg={resp.get('msg')}"
+            else:
+                m = resp.get("midboxData") or {}
+                l1 = m.get(f"smartLoad{smart_port}L1ActivePower")
+                l2 = m.get(f"smartLoad{smart_port}L2ActivePower")
+                if l1 is None and l2 is None:
+                    last_err = (f"smartLoad{smart_port} active power missing "
+                                "from midboxData")
+                else:
+                    try:
+                        return float(l1 or 0) + float(l2 or 0), None
+                    except (TypeError, ValueError):
+                        last_err = (f"unparseable smart-port power: "
+                                    f"{l1!r}+{l2!r}")
+        if attempt < READ_MAX_ATTEMPTS:
+            await asyncio.sleep(READ_RETRY_BACKOFF_S)
+    return None, last_err
 
 
 def _extract_setting_value(settings: dict[str, Any], hold_param: str) -> str | None:
@@ -331,9 +409,30 @@ async def _discover(api: EG4InverterAPI) -> int:
         k: v for k, v in settings.items()
         if "DISCH" in k or "SOC" in k or "EOD" in k
     }
+    # GridBoss smart-port sample so users can confirm EG4_EV_SMART_PORT and
+    # EG4_GRIDBOSS_SERIAL against the port their EV charger is wired to.
+    gridboss_serial = _resolve_gridboss_serial(api)
+    gridboss_smart_ports: dict[str, Any] = {}
+    if gridboss_serial:
+        try:
+            resp = await api._request(
+                "POST", f"{api._base_url}{MIDBOX_RUNTIME_ENDPOINT}",
+                f"serialNum={gridboss_serial}",
+            )
+            m = resp.get("midboxData") or {}
+            for p in (1, 2, 3, 4):
+                gridboss_smart_ports[f"port{p}"] = {
+                    "status": m.get(f"smartPort{p}Status"),
+                    "active_power_w": (m.get(f"smartLoad{p}L1ActivePower") or 0)
+                    + (m.get(f"smartLoad{p}L2ActivePower") or 0),
+                }
+        except Exception as e:  # noqa: BLE001 — best-effort diagnostic
+            gridboss_smart_ports = {"error": f"{type(e).__name__}: {e}"}
     print(json.dumps(
         {
             "serial": api._serialNum,
+            "gridboss_serial": gridboss_serial,
+            "gridboss_smart_ports": gridboss_smart_ports,
             "bank_status": bank_status,
             "settings": settings,
             "discharge_candidates": discharge_candidates,
@@ -391,27 +490,23 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> int:
-    # Hysteresis thresholds. Two separate W cutoffs so spiky/cloudy days don't
-    # flip the cap every 15 min. Defaults derived from EG4_PV_THRESHOLD_W (legacy
-    # single-threshold var) if the new ones aren't explicitly set, so existing
-    # deploys keep their behavior unless reconfigured.
-    legacy = _env_int("EG4_PV_THRESHOLD_W", 1700)
-    pv_cap_on_w = _env_int("EG4_PV_CAP_ON_W", legacy)
-    pv_cap_off_w = _env_int("EG4_PV_CAP_OFF_W", max(0, legacy - 500))
+    # EV-load hysteresis thresholds (watts on the GridBoss smart port). The cap
+    # engages only while the EV charger is actively drawing power (excess-solar
+    # charging), so normal household loads and idle periods never trip it. Two
+    # separate cutoffs give hysteresis around the ~1680 W charging boundary.
+    ev_cap_on_w = _env_int("EG4_EV_CAP_ON_W", DEFAULT_EV_CAP_ON_W)
+    ev_cap_off_w = _env_int("EG4_EV_CAP_OFF_W", DEFAULT_EV_CAP_OFF_W)
+    smart_port = _env_int("EG4_EV_SMART_PORT", int(DEFAULT_EV_SMART_PORT))
     # Hold-register SOC cutoff values (%).
-    normal_threshold = os.getenv(
-        "EG4_NORMAL_DISCHARGE_SOC", DEFAULT_NORMAL_SOC,
-    )
-    cap_on_threshold = os.getenv(
-        "EG4_CAP_ON_SOC", DEFAULT_CAP_ON_SOC,
-    )
+    normal_threshold = os.getenv("EG4_NORMAL_DISCHARGE_SOC", DEFAULT_NORMAL_SOC)
+    cap_on_threshold = os.getenv("EG4_CAP_ON_SOC", DEFAULT_CAP_ON_SOC)
     hold_param = os.getenv("EG4_HOLD_PARAM_DISCHARGE", DEFAULT_HOLD_PARAM_DISCHARGE)
     pv_field = os.getenv("EG4_PV_FIELD", "ppv")
 
-    if pv_cap_on_w < pv_cap_off_w:
+    if ev_cap_on_w < ev_cap_off_w:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
-               "error": f"EG4_PV_CAP_ON_W ({pv_cap_on_w}) must be >= "
-                        f"EG4_PV_CAP_OFF_W ({pv_cap_off_w}); otherwise "
+               "error": f"EG4_EV_CAP_ON_W ({ev_cap_on_w}) must be >= "
+                        f"EG4_EV_CAP_OFF_W ({ev_cap_off_w}); otherwise "
                         "hysteresis logic is inverted"})
         return 2
 
@@ -426,8 +521,7 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
         cap_on_int = int(float(cap_on_threshold))
     except ValueError:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
-               "error": f"EG4_CAP_ON_SOC not numeric: "
-                        f"{cap_on_threshold!r}"})
+               "error": f"EG4_CAP_ON_SOC not numeric: {cap_on_threshold!r}"})
         return 2
     if not SOC_MIN <= normal_int <= SOC_MAX:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
@@ -452,46 +546,62 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
     if args.apply:
         dry_run = False
 
-    rt = await api.get_inverter_runtime_async()
-    if hasattr(rt, "success") and rt.success is False:
+    # Resolve the GridBoss and read the EV charger's smart-port power — this is
+    # the decision input, so a failure fails safe (no write).
+    gridboss_serial = _resolve_gridboss_serial(api)
+    if not gridboss_serial:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
-               "error": f"runtime read failed: {getattr(rt, 'error_message', '?')}"})
+               "error": "could not resolve GridBoss serial; set "
+                        "EG4_GRIDBOSS_SERIAL to the MidBox serial number"})
         return 2
 
-    pv_w = _extract_pv_w(rt, pv_field)
-    if pv_w is None:
+    ev_w, ev_err = await _read_ev_power(api, gridboss_serial, smart_port)
+    if ev_w is None:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
-               "pv_field": pv_field,
-               "error": f"PV field '{pv_field}' missing/unparseable in runtime data"})
+               "gridboss_serial": gridboss_serial, "smart_port": smart_port,
+               "error": f"EV smart-port power read failed: {ev_err}"})
         return 2
 
-    # Read current setting first; needed both for hold-zone behavior and the
-    # idempotency check below. Retry on transient DEVICE_OFFLINE storms or
-    # responses that omit the hold-param key.
+    # Best-effort PV/SOC context for the logs; never gates the decision.
+    pv_w = None
+    soc = None
+    try:
+        rt = await api.get_inverter_runtime_async()
+        if not (hasattr(rt, "success") and rt.success is False):
+            pv_w = _extract_pv_w(rt, pv_field)
+            soc = getattr(rt, "soc", None)
+    except Exception:  # noqa: BLE001 — context only, safe to ignore
+        pass
+
+    # Read current setting; needed for hold-zone behavior and idempotency.
     setting_banks = _parse_setting_banks(os.getenv("EG4_SETTING_BANKS"))
     current_raw, bank_status, read_attempts = await _read_hold_param_with_retry(
         api, hold_param, setting_banks,
     )
     if current_raw is None:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
-               "pv_w": pv_w, "hold_param": hold_param,
+               "ev_w": ev_w, "hold_param": hold_param,
                "bank_status": bank_status, "read_attempts": read_attempts,
                "error": f"hold_param '{hold_param}' not found after "
                         f"{read_attempts} settings-read attempts; "
                         "run --discover to confirm key / firmware health"})
         return 2
 
-    # Three-zone hysteresis:
-    #   PV >  cap_on_w   → cap_on  (write cap_on threshold)
-    #   PV <  cap_off_w  → cap_off (write normal threshold)
-    #   between          → hold    (leave current value alone)
-    # The "hold" zone is what prevents flapping when PV spikes around a single
-    # threshold. We define `desired_value = current_raw` so the idempotency
-    # check below will naturally short-circuit with action=none.
-    if pv_w > pv_cap_on_w:
+    # Common context included in every decision log line.
+    ctx = {
+        "ev_w": ev_w, "ev_cap_on_w": ev_cap_on_w, "ev_cap_off_w": ev_cap_off_w,
+        "smart_port": smart_port, "gridboss_serial": gridboss_serial,
+        "pv_w": pv_w, "soc": soc, "hold_param": hold_param,
+    }
+
+    # Three-zone hysteresis on EV smart-port power:
+    #   ev_w > cap_on_w   → cap_on  (EV excess-solar charging; block discharge)
+    #   ev_w < cap_off_w  → cap_off (EV idle; normal battery behavior)
+    #   between           → hold    (leave current value alone)
+    if ev_w > ev_cap_on_w:
         decision = "cap_on"
         desired_value = str(cap_on_int)
-    elif pv_w < pv_cap_off_w:
+    elif ev_w < ev_cap_off_w:
         decision = "cap_off"
         desired_value = str(normal_int)
     else:
@@ -501,31 +611,25 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
     if _numeric_equal(current_raw, desired_value):
         reason = ("in hysteresis hold zone" if decision == "hold"
                   else "already at desired value")
-        _emit({"decision": decision, "action": "none", "verify": "skipped",
-               "pv_w": pv_w, "pv_cap_on_w": pv_cap_on_w,
-               "pv_cap_off_w": pv_cap_off_w,
-               "current_value": current_raw, "desired_value": desired_value,
-               "hold_param": hold_param, "dry_run": dry_run,
+        _emit({**ctx, "decision": decision, "action": "none",
+               "verify": "skipped", "current_value": current_raw,
+               "desired_value": desired_value, "dry_run": dry_run,
                "reason": reason})
         return 0
 
     if dry_run:
-        _emit({"decision": decision, "action": "would_write", "verify": "skipped",
-               "pv_w": pv_w, "pv_cap_on_w": pv_cap_on_w,
-               "pv_cap_off_w": pv_cap_off_w,
-               "current_value": current_raw, "desired_value": desired_value,
-               "hold_param": hold_param, "dry_run": True})
+        _emit({**ctx, "decision": decision, "action": "would_write",
+               "verify": "skipped", "current_value": current_raw,
+               "desired_value": desired_value, "dry_run": True})
         return 0
 
     ok, write_resp, write_attempts = await _write_hold_param_with_retry(
         api, hold_param, desired_value,
     )
     if not ok:
-        _emit({"decision": decision, "action": "write", "verify": "skipped",
-               "pv_w": pv_w, "pv_cap_on_w": pv_cap_on_w,
-               "pv_cap_off_w": pv_cap_off_w,
-               "current_value": current_raw, "desired_value": desired_value,
-               "hold_param": hold_param, "dry_run": False,
+        _emit({**ctx, "decision": decision, "action": "write",
+               "verify": "skipped", "current_value": current_raw,
+               "desired_value": desired_value, "dry_run": False,
                "write_attempts": write_attempts,
                "write_msg": write_resp.get("msg"),
                "write_msg_code": write_resp.get("msgCode"),
@@ -542,13 +646,10 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
         verify = "pass"
     else:
         verify = "fail"
-    _emit({"decision": decision, "action": "write", "verify": verify,
-           "pv_w": pv_w, "pv_cap_on_w": pv_cap_on_w,
-           "pv_cap_off_w": pv_cap_off_w,
+    _emit({**ctx, "decision": decision, "action": "write", "verify": verify,
            "current_value": current_raw, "desired_value": desired_value,
-           "post_write_value": verify_raw, "hold_param": hold_param,
-           "dry_run": False, "write_attempts": write_attempts,
-           "verify_attempts": verify_attempts})
+           "post_write_value": verify_raw, "dry_run": False,
+           "write_attempts": write_attempts, "verify_attempts": verify_attempts})
     return 0 if verify == "pass" else 1
 
 
