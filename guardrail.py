@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""EG4 battery discharge guardrail.
+"""EG4 battery discharge guardrail and optional pre-peak top-up.
 
 Stateless script intended for cron. Each run:
-  authenticate → read telemetry → decide desired discharge cap →
-  read current setting → write only if different → verify by re-read →
+  authenticate → read telemetry → decide desired controls →
+  read current settings → write only differences → verify by re-read →
   emit one structured JSON log line.
 
 See README.md for usage; the design rationale is summarized there.
@@ -17,8 +17,9 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from eg4_inverter_api import EG4InverterAPI
 from eg4_inverter_api.constants import INVERTER_PARAMETER_READ, INVERTER_PARAMETER_WRITE
@@ -85,6 +86,7 @@ SOC_MAX = 100
 # charging), so normal household loads and idle periods never trip it. We read
 # per-port active power (W) from the midbox runtime endpoint and sum L1+L2.
 MIDBOX_RUNTIME_ENDPOINT = "/WManage/api/midbox/getMidboxRuntime"
+FUNCTION_CONTROL_ENDPOINT = "/WManage/web/maintain/remoteSet/functionControl"
 
 # GridBoss smart port the EV charger is wired to (1-4). UI: "Smart Port N".
 DEFAULT_EV_SMART_PORT = "1"
@@ -95,6 +97,17 @@ DEFAULT_EV_SMART_PORT = "1"
 # the previous state is held (prevents flapping at the charging boundary).
 DEFAULT_EV_CAP_ON_W = 1500
 DEFAULT_EV_CAP_OFF_W = 1000
+
+# Optional cloudy-day grid top-up. The inverter's native AC-charge schedule
+# remains authoritative; this controller arms the mode shortly before that
+# window, then disables it as soon as the target SOC is reached.
+DEFAULT_TOP_UP_TIMEZONE = "America/Los_Angeles"
+DEFAULT_TOP_UP_START = "14:00"
+DEFAULT_TOP_UP_END = "15:00"
+DEFAULT_TOP_UP_ARM_MINUTES = 30
+DEFAULT_TOP_UP_TARGET_SOC = 65
+DEFAULT_HOLD_PARAM_AC_CHARGE = "FUNC_AC_CHARGE"
+DEFAULT_HOLD_PARAM_AC_CHARGE_SOC = "HOLD_AC_CHARGE_SOC_LIMIT"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -330,33 +343,96 @@ def _parse_setting_banks(raw: str | None) -> tuple[int, ...]:
     return tuple(int(p) for p in parts)
 
 
-async def _read_hold_param_with_retry(
+async def _read_hold_params_with_retry(
     api: EG4InverterAPI,
-    hold_param: str,
+    hold_params: tuple[str, ...],
     banks: tuple[int, ...],
-) -> tuple[str | None, dict[int, dict[str, Any]], int]:
-    """Read `hold_param` via the bank sweep, retrying when missing or transient.
+) -> tuple[dict[str, str], dict[int, dict[str, Any]], int]:
+    """Read hold params via one bank sweep, retrying missing/transient values.
 
-    Returns (value_or_None, last_bank_status, attempts). The EG4 cloud
+    Returns (found_values, last_bank_status, attempts). The EG4 cloud
     sometimes returns success=true for a bank but omits individual keys, so
     we retry on "value not found" as well as on DEVICE_OFFLINE storms.
     """
     last_status: dict[int, dict[str, Any]] = {}
     for attempt in range(1, READ_MAX_ATTEMPTS + 1):
         settings, last_status = await _read_settings_tolerant(api, banks)
-        val = _extract_setting_value(settings, hold_param)
-        if val is not None:
-            return val, last_status, attempt
+        values = {
+            param: value
+            for param in hold_params
+            if (value := _extract_setting_value(settings, param)) is not None
+        }
+        missing = [param for param in hold_params if param not in values]
+        if not missing:
+            return values, last_status, attempt
         if attempt < READ_MAX_ATTEMPTS:
             reason = ("transient cloud error"
                       if _bank_status_has_transient(last_status)
-                      else "key missing")
+                      else f"keys missing: {', '.join(missing)}")
             logging.info(
-                "settings read attempt %d/%d for %s: %s; sleeping %ds and retrying",
-                attempt, READ_MAX_ATTEMPTS, hold_param, reason, READ_RETRY_BACKOFF_S,
+                "settings read attempt %d/%d: %s; sleeping %ds and retrying",
+                attempt, READ_MAX_ATTEMPTS, reason, READ_RETRY_BACKOFF_S,
             )
             await asyncio.sleep(READ_RETRY_BACKOFF_S)
-    return None, last_status, READ_MAX_ATTEMPTS
+    return values, last_status, READ_MAX_ATTEMPTS
+
+
+async def _read_hold_param_with_retry(
+    api: EG4InverterAPI,
+    hold_param: str,
+    banks: tuple[int, ...],
+) -> tuple[str | None, dict[int, dict[str, Any]], int]:
+    values, status, attempts = await _read_hold_params_with_retry(
+        api, (hold_param,), banks,
+    )
+    return values.get(hold_param), status, attempts
+
+
+def _parse_hhmm(raw: str, name: str) -> time:
+    try:
+        return datetime.strptime(raw, "%H:%M").time()
+    except ValueError as e:
+        raise ValueError(f"{name} must use 24-hour HH:MM, got {raw!r}") from e
+
+
+def _parse_bool_setting(raw: str) -> bool:
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "on", "enabled", "enable"}:
+        return True
+    if normalized in {"0", "false", "off", "disabled", "disable"}:
+        return False
+    raise ValueError(f"unrecognized boolean setting value {raw!r}")
+
+
+def _top_up_decision(
+    now: datetime,
+    start: time,
+    end: time,
+    arm_minutes: int,
+    target_soc: int,
+    soc: float | None,
+    ac_charge_enabled: bool,
+) -> tuple[str, bool]:
+    """Return the top-up phase and desired AC-charge enable state."""
+    start_at = datetime.combine(now.date(), start, tzinfo=now.tzinfo)
+    end_at = datetime.combine(now.date(), end, tzinfo=now.tzinfo)
+    if end_at <= start_at:
+        raise ValueError("top-up window must start and end on the same day")
+    arm_at = start_at - timedelta(minutes=arm_minutes)
+
+    if arm_at <= now < start_at:
+        if soc is None:
+            return "telemetry_unavailable", False
+        return ("arm" if soc < target_soc else "not_needed"), soc < target_soc
+    if start_at <= now < end_at:
+        if not ac_charge_enabled:
+            return "complete", False
+        if soc is None:
+            return "telemetry_unavailable", False
+        if soc >= target_soc:
+            return "target_reached", False
+        return "charging", True
+    return "standby", False
 
 
 async def _write_hold_param_with_retry(
@@ -364,15 +440,24 @@ async def _write_hold_param_with_retry(
     hold_param: str,
     value_text: str,
 ) -> tuple[bool, dict[str, Any], int]:
-    """Write a hold register, retrying transient cloud errors.
+    """Write a hold register or function switch, retrying transient errors.
 
     Returns (success, last_response, attempts). We bypass the library's
     write_setting_async because it discards the response body; we need the
     msgCode to decide whether retrying is worthwhile.
     """
-    url = f"{api._base_url}{INVERTER_PARAMETER_WRITE}"
-    payload = (f"inverterSn={api._serialNum}&holdParam={hold_param}"
-               f"&valueText={value_text}&clientType=WEB&remoteSetType=NORMAL")
+    if hold_param.startswith("FUNC_"):
+        url = f"{api._base_url}{FUNCTION_CONTROL_ENDPOINT}"
+        enabled = _parse_bool_setting(value_text)
+        payload = (
+            f"inverterSn={api._serialNum}&functionParam={hold_param}"
+            f"&enable={'true' if enabled else 'false'}"
+            "&clientType=WEB&remoteSetType=NORMAL"
+        )
+    else:
+        url = f"{api._base_url}{INVERTER_PARAMETER_WRITE}"
+        payload = (f"inverterSn={api._serialNum}&holdParam={hold_param}"
+                   f"&valueText={value_text}&clientType=WEB&remoteSetType=NORMAL")
     last: dict[str, Any] = {}
     for attempt in range(1, WRITE_MAX_ATTEMPTS + 1):
         try:
@@ -409,6 +494,10 @@ async def _discover(api: EG4InverterAPI) -> int:
         k: v for k, v in settings.items()
         if "DISCH" in k or "SOC" in k or "EOD" in k
     }
+    top_up_candidates = {
+        k: v for k, v in settings.items()
+        if "AC_CHARGE" in k
+    }
     # GridBoss smart-port sample so users can confirm EG4_EV_SMART_PORT and
     # EG4_GRIDBOSS_SERIAL against the port their EV charger is wired to.
     gridboss_serial = _resolve_gridboss_serial(api)
@@ -436,6 +525,7 @@ async def _discover(api: EG4InverterAPI) -> int:
             "bank_status": bank_status,
             "settings": settings,
             "discharge_candidates": discharge_candidates,
+            "top_up_candidates": top_up_candidates,
             "runtime_keys": sorted(rt_dict.keys()),
             "runtime_pv_sample": {
                 k: rt_dict.get(k)
@@ -502,6 +592,13 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
     cap_on_threshold = os.getenv("EG4_CAP_ON_SOC", DEFAULT_CAP_ON_SOC)
     hold_param = os.getenv("EG4_HOLD_PARAM_DISCHARGE", DEFAULT_HOLD_PARAM_DISCHARGE)
     pv_field = os.getenv("EG4_PV_FIELD", "ppv")
+    top_up_enabled = _env_bool("EG4_TOP_UP_ENABLED", False)
+    top_up_hold_param = os.getenv(
+        "EG4_HOLD_PARAM_AC_CHARGE", DEFAULT_HOLD_PARAM_AC_CHARGE,
+    )
+    top_up_soc_hold_param = os.getenv(
+        "EG4_HOLD_PARAM_AC_CHARGE_SOC", DEFAULT_HOLD_PARAM_AC_CHARGE_SOC,
+    )
 
     if ev_cap_on_w < ev_cap_off_w:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
@@ -540,6 +637,56 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
                         "otherwise cap-on would not raise the cutoff"})
         return 2
 
+    top_up_config: dict[str, Any] | None = None
+    if top_up_enabled:
+        try:
+            top_up_target_soc = _env_int(
+                "EG4_TOP_UP_TARGET_SOC", DEFAULT_TOP_UP_TARGET_SOC,
+            )
+            top_up_arm_minutes = _env_int(
+                "EG4_TOP_UP_ARM_MINUTES", DEFAULT_TOP_UP_ARM_MINUTES,
+            )
+            top_up_start = _parse_hhmm(
+                os.getenv("EG4_TOP_UP_START", DEFAULT_TOP_UP_START),
+                "EG4_TOP_UP_START",
+            )
+            top_up_end = _parse_hhmm(
+                os.getenv("EG4_TOP_UP_END", DEFAULT_TOP_UP_END),
+                "EG4_TOP_UP_END",
+            )
+            top_up_timezone_name = os.getenv(
+                "EG4_TOP_UP_TIMEZONE", DEFAULT_TOP_UP_TIMEZONE,
+            )
+            top_up_timezone = ZoneInfo(top_up_timezone_name)
+            if not SOC_MIN <= top_up_target_soc <= SOC_MAX:
+                raise ValueError(
+                    f"EG4_TOP_UP_TARGET_SOC must be {SOC_MIN}..{SOC_MAX}, "
+                    f"got {top_up_target_soc}"
+                )
+            if not 1 <= top_up_arm_minutes <= 180:
+                raise ValueError(
+                    "EG4_TOP_UP_ARM_MINUTES must be 1..180, "
+                    f"got {top_up_arm_minutes}"
+                )
+            # Validate the same-day window before making any API calls.
+            probe_now = datetime.now(top_up_timezone)
+            _top_up_decision(
+                probe_now, top_up_start, top_up_end, top_up_arm_minutes,
+                top_up_target_soc, 0.0, False,
+            )
+            top_up_config = {
+                "target_soc": top_up_target_soc,
+                "arm_minutes": top_up_arm_minutes,
+                "start": top_up_start,
+                "end": top_up_end,
+                "timezone": top_up_timezone,
+                "timezone_name": top_up_timezone_name,
+            }
+        except (ValueError, ZoneInfoNotFoundError) as e:
+            _emit({"decision": "error", "action": "none", "verify": "skipped",
+                   "error": f"top-up configuration: {e}"})
+            return 2
+
     dry_run = _env_bool("EG4_DRY_RUN", True)
     if args.dry_run:
         dry_run = True
@@ -562,30 +709,40 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
                "error": f"EV smart-port power read failed: {ev_err}"})
         return 2
 
-    # Best-effort PV/SOC context for the logs; never gates the decision.
+    # Runtime is best-effort context for the EV guardrail, but SOC is required
+    # while the optional top-up is arming or active.
     pv_w = None
-    soc = None
+    soc: float | None = None
     try:
         rt = await api.get_inverter_runtime_async()
         if not (hasattr(rt, "success") and rt.success is False):
             pv_w = _extract_pv_w(rt, pv_field)
-            soc = getattr(rt, "soc", None)
+            soc_raw = getattr(rt, "soc", None)
+            if soc_raw not in (None, ""):
+                soc = float(soc_raw)
     except Exception:  # noqa: BLE001 — context only, safe to ignore
         pass
 
-    # Read current setting; needed for hold-zone behavior and idempotency.
+    # Read all controlled settings in one sweep to minimize EG4 dongle load.
     setting_banks = _parse_setting_banks(os.getenv("EG4_SETTING_BANKS"))
-    current_raw, bank_status, read_attempts = await _read_hold_param_with_retry(
-        api, hold_param, setting_banks,
+    required_params = [hold_param]
+    if top_up_enabled:
+        required_params.extend((top_up_hold_param, top_up_soc_hold_param))
+    current_values, bank_status, read_attempts = await _read_hold_params_with_retry(
+        api, tuple(required_params), setting_banks,
     )
-    if current_raw is None:
+    missing_params = [
+        param for param in required_params if param not in current_values
+    ]
+    if missing_params:
         _emit({"decision": "error", "action": "none", "verify": "skipped",
                "ev_w": ev_w, "hold_param": hold_param,
                "bank_status": bank_status, "read_attempts": read_attempts,
-               "error": f"hold_param '{hold_param}' not found after "
-                        f"{read_attempts} settings-read attempts; "
+               "error": f"hold params not found after {read_attempts} "
+                        f"settings-read attempts: {', '.join(missing_params)}; "
                         "run --discover to confirm key / firmware health"})
         return 2
+    current_raw = current_values[hold_param]
 
     # Common context included in every decision log line.
     ctx = {
@@ -608,49 +765,143 @@ async def _decide_and_write(api: EG4InverterAPI, args: argparse.Namespace) -> in
         decision = "hold"
         desired_value = current_raw
 
-    if _numeric_equal(current_raw, desired_value):
+    writes: list[tuple[str, str, str]] = []
+    if not _numeric_equal(current_raw, desired_value):
+        writes.append((hold_param, desired_value, "ev_discharge_cap"))
+
+    top_up_ctx: dict[str, Any] | None = None
+    top_up_error = False
+    if top_up_config is not None:
+        ac_charge_raw = current_values[top_up_hold_param]
+        try:
+            ac_charge_enabled = _parse_bool_setting(ac_charge_raw)
+            local_now = datetime.now(top_up_config["timezone"])
+            top_up_phase, desired_ac_charge = _top_up_decision(
+                local_now,
+                top_up_config["start"],
+                top_up_config["end"],
+                top_up_config["arm_minutes"],
+                top_up_config["target_soc"],
+                soc,
+                ac_charge_enabled,
+            )
+        except ValueError as e:
+            _emit({**ctx, "decision": "error", "action": "none",
+                   "verify": "skipped", "current_value": current_raw,
+                   "desired_value": desired_value,
+                   "error": f"top-up decision: {e}"})
+            return 2
+
+        desired_ac_charge_raw = "true" if desired_ac_charge else "false"
+        top_up_error = top_up_phase == "telemetry_unavailable"
+        current_target_raw = current_values[top_up_soc_hold_param]
+        target_raw = str(top_up_config["target_soc"])
+        # The feature owns this limit while enabled, ensuring the inverter's
+        # native stop threshold agrees with the controller's threshold.
+        if not _numeric_equal(current_target_raw, target_raw):
+            writes.insert(
+                0, (top_up_soc_hold_param, target_raw, "top_up_target"),
+            )
+        if ac_charge_enabled != desired_ac_charge:
+            writes.append(
+                (top_up_hold_param, desired_ac_charge_raw, "top_up_mode"),
+            )
+        top_up_ctx = {
+            "enabled": True,
+            "phase": top_up_phase,
+            "local_time": local_now.isoformat(),
+            "timezone": top_up_config["timezone_name"],
+            "window": (
+                f"{top_up_config['start'].strftime('%H:%M')}-"
+                f"{top_up_config['end'].strftime('%H:%M')}"
+            ),
+            "target_soc": top_up_config["target_soc"],
+            "current_target_soc": current_target_raw,
+            "ac_charge_current": ac_charge_raw,
+            "ac_charge_desired": desired_ac_charge_raw,
+            "error": (
+                "battery SOC unavailable; forcing AC Charge off"
+                if top_up_error else None
+            ),
+        }
+
+    log_ctx = {
+        **ctx,
+        "decision": decision,
+        "current_value": current_raw,
+        "desired_value": desired_value,
+        "dry_run": dry_run,
+        "top_up": top_up_ctx,
+    }
+    if not writes:
         reason = ("in hysteresis hold zone" if decision == "hold"
-                  else "already at desired value")
-        _emit({**ctx, "decision": decision, "action": "none",
-               "verify": "skipped", "current_value": current_raw,
-               "desired_value": desired_value, "dry_run": dry_run,
+                  else "all settings already at desired values")
+        _emit({**log_ctx, "action": "none", "verify": "skipped",
                "reason": reason})
-        return 0
+        return 2 if top_up_error else 0
 
+    planned_writes = [
+        {"hold_param": param, "value": value, "purpose": purpose}
+        for param, value, purpose in writes
+    ]
     if dry_run:
-        _emit({**ctx, "decision": decision, "action": "would_write",
-               "verify": "skipped", "current_value": current_raw,
-               "desired_value": desired_value, "dry_run": True})
-        return 0
+        _emit({**log_ctx, "action": "would_write", "verify": "skipped",
+               "writes": planned_writes})
+        return 2 if top_up_error else 0
 
-    ok, write_resp, write_attempts = await _write_hold_param_with_retry(
-        api, hold_param, desired_value,
+    write_results: list[dict[str, Any]] = []
+    for param, value, purpose in writes:
+        ok, write_resp, write_attempts = await _write_hold_param_with_retry(
+            api, param, value,
+        )
+        result = {
+            "hold_param": param,
+            "value": value,
+            "purpose": purpose,
+            "success": ok,
+            "attempts": write_attempts,
+            "msg": write_resp.get("msg"),
+            "msg_code": write_resp.get("msgCode"),
+        }
+        write_results.append(result)
+        if not ok:
+            _emit({**log_ctx, "action": "write", "verify": "skipped",
+                   "writes": write_results,
+                   "error": f"write failed for {param} after "
+                            f"{write_attempts} attempts: "
+                            f"{write_resp.get('msg') or write_resp.get('error') or 'unknown'}"})
+            return 1
+
+    verify_values, _, verify_attempts = await _read_hold_params_with_retry(
+        api, tuple(param for param, _, _ in writes), setting_banks,
     )
-    if not ok:
-        _emit({**ctx, "decision": decision, "action": "write",
-               "verify": "skipped", "current_value": current_raw,
-               "desired_value": desired_value, "dry_run": False,
-               "write_attempts": write_attempts,
-               "write_msg": write_resp.get("msg"),
-               "write_msg_code": write_resp.get("msgCode"),
-               "error": f"write failed after {write_attempts} attempts: "
-                        f"{write_resp.get('msg') or write_resp.get('error') or 'unknown'}"})
+    verify_results = []
+    verify_ok = True
+    for param, desired, purpose in writes:
+        actual = verify_values.get(param)
+        if param == top_up_hold_param and actual is not None:
+            try:
+                matches = _parse_bool_setting(actual) == _parse_bool_setting(desired)
+            except ValueError:
+                matches = False
+        else:
+            matches = actual is not None and _numeric_equal(actual, desired)
+        verify_ok = verify_ok and matches
+        verify_results.append({
+            "hold_param": param,
+            "purpose": purpose,
+            "desired": desired,
+            "actual": actual,
+            "pass": matches,
+        })
+
+    verify = "pass" if verify_ok else "fail"
+    _emit({**log_ctx, "action": "write", "verify": verify,
+           "writes": write_results, "verify_results": verify_results,
+           "verify_attempts": verify_attempts})
+    if not verify_ok:
         return 1
-
-    verify_raw, _, verify_attempts = await _read_hold_param_with_retry(
-        api, hold_param, setting_banks,
-    )
-    if verify_raw is None:
-        verify = "unknown"
-    elif _numeric_equal(verify_raw, desired_value):
-        verify = "pass"
-    else:
-        verify = "fail"
-    _emit({**ctx, "decision": decision, "action": "write", "verify": verify,
-           "current_value": current_raw, "desired_value": desired_value,
-           "post_write_value": verify_raw, "dry_run": False,
-           "write_attempts": write_attempts, "verify_attempts": verify_attempts})
-    return 0 if verify == "pass" else 1
+    return 2 if top_up_error else 0
 
 
 def _numeric_equal(a: str, b: str) -> bool:

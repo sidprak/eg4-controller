@@ -65,6 +65,45 @@ backfill, and correctly throttles itself. Off-grid/EPS backup is untouched
 Crucially this does **not** touch `HOLD_SOC_LOW_LIMIT_EPS_DISCHG` (the
 off-grid floor, currently `0`), so EPS/backup keeps full battery access.
 
+## Cloudy-day pre-peak top-up
+
+The optional top-up controller fills the battery from grid before peak hours,
+then returns the inverter to self-consumption as soon as the target is reached.
+It is disabled by default.
+
+First configure the inverter's native **AC Charge** schedule with one window
+from **14:00 to 15:00**, select its time-based / **According to Time** mode,
+and disable its other AC Charge windows. This is required so arming the switch
+at 13:30 cannot start charging early. Leave Battery Charge Control in SOC mode.
+Then enable:
+
+```sh
+EG4_TOP_UP_ENABLED=1
+EG4_TOP_UP_TIMEZONE=America/Los_Angeles
+EG4_TOP_UP_START=14:00
+EG4_TOP_UP_END=15:00
+EG4_TOP_UP_TARGET_SOC=65
+```
+
+The controller uses the native schedule as a safety boundary:
+
+| Local time / state | Action |
+|---|---|
+| 13:30–14:00, SOC below 65% | Set the AC Charge SOC limit to 65% and arm AC Charge |
+| 13:30–14:00, SOC at/above 65% | Keep AC Charge off; no grid top-up is needed |
+| 14:00–15:00, AC Charge armed | Keep charging until SOC reaches 65% |
+| SOC reaches 65% | Disable AC Charge immediately, restoring PV→house and excess PV→battery |
+| AC Charge already off during the window | Keep it off, even if SOC later dips; this prevents restart cycling |
+| Outside the arm/window period | Keep AC Charge off |
+
+With the default 30-minute cadence, AC Charge is disabled on the next
+half-hour invocation after the target is reached. The extra off-peak charging
+is harmless if the battery reaches 65% between runs.
+`EG4_HOLD_PARAM_AC_CHARGE=FUNC_AC_CHARGE` and
+`EG4_HOLD_PARAM_AC_CHARGE_SOC=HOLD_AC_CHARGE_SOC_LIMIT` are the FlexBOSS21
+cloud keys; confirm them with `--discover` before enabling this on another
+model.
+
 ## Confirm the hold-register key (one-time, read-only)
 
 The defaults above are verified on **FlexBOSS21**. If you're on a different

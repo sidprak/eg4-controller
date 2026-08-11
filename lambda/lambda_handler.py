@@ -1,4 +1,4 @@
-"""AWS Lambda entrypoint for the EG4 discharge guardrail.
+"""AWS Lambda entrypoint for the EG4 battery controller.
 
 The CLI script (`guardrail.py`) does all the real work. This module is a
 thin adapter that:

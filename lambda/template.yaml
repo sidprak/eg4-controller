@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: EG4 battery discharge guardrail (Lambda container + EventBridge cron)
+Description: EG4 battery guardrail and pre-peak top-up (Lambda container + EventBridge cron)
 
 Parameters:
   EG4Username:
@@ -55,6 +55,37 @@ Parameters:
   PvField:
     Type: String
     Default: "ppv"
+  TopUpEnabled:
+    Type: String
+    Default: "0"
+    AllowedValues: ["0", "1"]
+    Description: 1 = manage the inverter AC Charge switch for cloudy-day top-up. Requires a matching native AC Charge schedule.
+  TopUpTimezone:
+    Type: String
+    Default: "America/Los_Angeles"
+    Description: IANA timezone used for the top-up window.
+  TopUpStart:
+    Type: String
+    Default: "14:00"
+    Description: Native AC Charge schedule start in local 24-hour HH:MM.
+  TopUpEnd:
+    Type: String
+    Default: "15:00"
+    Description: Native AC Charge schedule end in local 24-hour HH:MM.
+  TopUpArmMinutes:
+    Type: String
+    Default: "30"
+    Description: Minutes before the window during which AC Charge may be armed if SOC is below target.
+  TopUpTargetSoc:
+    Type: String
+    Default: "65"
+    Description: Battery SOC target for the pre-peak grid top-up.
+  HoldParamAcCharge:
+    Type: String
+    Default: "FUNC_AC_CHARGE"
+  HoldParamAcChargeSoc:
+    Type: String
+    Default: "HOLD_AC_CHARGE_SOC_LIMIT"
   AlarmEmail:
     Type: String
     Default: ""
@@ -74,10 +105,9 @@ Resources:
       PackageType: Image
       Architectures: [arm64]
       MemorySize: 256
-      # Worst-case run: ~30 s normal EG4 cloud latency + one write retry
-      # (90 s sleep + ~5 s) + one verify-read retry (45 s + ~5 s) ≈ 175 s.
-      # 240 s leaves headroom for cold start and longer cloud latency.
-      Timeout: 240
+      # Worst case can include three independently retried writes (top-up
+      # target, AC-charge mode, EV cap) plus a retried verification read.
+      Timeout: 420
       Events:
         ScheduledRun:
           Type: Schedule
@@ -99,6 +129,14 @@ Resources:
           EG4_CAP_ON_SOC: !Ref CapOnSoc
           EG4_HOLD_PARAM_DISCHARGE: !Ref HoldParamDischarge
           EG4_PV_FIELD: !Ref PvField
+          EG4_TOP_UP_ENABLED: !Ref TopUpEnabled
+          EG4_TOP_UP_TIMEZONE: !Ref TopUpTimezone
+          EG4_TOP_UP_START: !Ref TopUpStart
+          EG4_TOP_UP_END: !Ref TopUpEnd
+          EG4_TOP_UP_ARM_MINUTES: !Ref TopUpArmMinutes
+          EG4_TOP_UP_TARGET_SOC: !Ref TopUpTargetSoc
+          EG4_HOLD_PARAM_AC_CHARGE: !Ref HoldParamAcCharge
+          EG4_HOLD_PARAM_AC_CHARGE_SOC: !Ref HoldParamAcChargeSoc
       LoggingConfig:
         LogFormat: JSON
     Metadata:
@@ -131,7 +169,7 @@ Resources:
 
   # "Sustained failure" alarm: fires only when the Lambda has at least one
   # error in EACH of the last 3 consecutive 1-hour buckets. With the
-  # default 30-min schedule that's 6 invocations spanning 3 hours, so this
+  # The default 30-min schedule gives 6 invocations spanning 3 hours, so this
   # catches "the guardrail has been broken for a while" rather than "one
   # transient EG4 cloud blip that the retry logic should handle". The
   # retry logic in guardrail.py already handles single DEVICE_OFFLINE

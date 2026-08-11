@@ -1,6 +1,6 @@
 # Deploy to AWS Lambda
 
-Stateless Lambda container image, scheduled by EventBridge every 15 min.
+Stateless Lambda container image, scheduled by EventBridge every 30 min.
 Cost: **$0/month** within the AWS perpetual free tier (1 M Lambda requests
 + 400 k GB-s/mo + 14 M EventBridge invocations + 5 GB CloudWatch ingest).
 
@@ -34,6 +34,9 @@ The `--guided` wizard will ask for:
 - **EG4SerialNumber** — leave blank to use the first inverter on your
   account, or paste your inverter SN
 - **DryRun** — leave `1` for the first deploy
+- **TopUpEnabled** — set `1` only after configuring the inverter's native
+  AC Charge **According to Time** window to match `TopUpStart` / `TopUpEnd`
+- **TopUpTimezone** — `America/Los_Angeles`
 - **AlarmEmail** — *(optional)* email to receive sustained-failure
   alerts. Leave blank to skip. See [Alerting](#alerting) below.
 - (other params) — defaults match the verified FlexBOSS21 setup

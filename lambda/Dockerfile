@@ -1,4 +1,4 @@
-# Lambda container image for the EG4 discharge guardrail.
+# Lambda container image for the EG4 battery controller.
 # Build context is the repo root so we can COPY guardrail.py + requirements.txt.
 FROM public.ecr.aws/lambda/python:3.11
 
